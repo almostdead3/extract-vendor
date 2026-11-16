@@ -1,0 +1,194 @@
+name: Extract vendor.img
+
+on:
+  workflow_dispatch:
+    inputs:
+      oneplus_link:
+        description: "OnePlus 6 ROM link - paste here"
+        required: false
+        default: ""
+      poco_link:
+        description: "Poco F1 ROM link - paste here"
+        required: false
+        default: ""
+      release_tag:
+        description: "Release tag to upload to"
+        required: false
+        default: "vendor-images"
+      extract_sensors:
+        description: "Also pull sensors files + checksums from each vendor"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      OP_LINK: ${{ inputs.oneplus_link }}
+      POCO_LINK: ${{ inputs.poco_link }}
+      TAG: ${{ inputs.release_tag }}
+    steps:
+      - name: Check links
+        run: |
+          if [ -z "$OP_LINK" ] && [ -z "$POCO_LINK" ]; then
+            echo "Paste at least one link (OnePlus 6 or Poco F1)"; exit 1
+          fi
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y aria2 brotli android-sdk-libsparse-utils xz-utils p7zip-full unzip file zip
+          python3 -m pip install --break-system-packages gdown
+          go install github.com/ssut/payload-dumper-go@latest
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+          curl -fsSL https://raw.githubusercontent.com/xpirt/sdat2img/master/sdat2img.py -o "$HOME/sdat2img.py"
+
+      - name: Download and extract vendor.img
+        run: |
+          set -euo pipefail
+          ROOT="$PWD"
+          mkdir -p out work
+          SDAT="$HOME/sdat2img.py"
+
+          fetch() {  # url outfile
+            if echo "$1" | grep -q "drive.google.com"; then
+              gdown --fuzzy "$1" -O "$2"
+            else
+              aria2c -x16 -s16 -k1M --file-allocation=none -d . -o "$2" "$1"
+            fi
+          }
+
+          make_vendor() {  # name url
+            local name="$1" url="$2"
+            [ -z "$url" ] && return 0
+            echo "::group::$name"
+            rm -rf "work/$name"; mkdir -p "work/$name"; cd "work/$name"
+
+            fetch "$url" rom.bin
+            local kind; kind="$(file -b rom.bin)"
+            echo "Downloaded: $kind"
+
+            if [ "$(head -c4 rom.bin)" = "CrAU" ]; then
+              # raw payload.bin
+              payload-dumper-go -p vendor -o pd rom.bin
+
+            elif echo "$kind" | grep -qi "zip"; then
+              unzip -Z1 rom.bin > list.txt
+              if grep -qE '(^|/)payload\.bin$' list.txt; then
+                # A/B OTA: pull only payload.bin, then only the vendor partition
+                unzip -j -o rom.bin '*payload.bin' -d .
+                rm -f rom.bin
+                payload-dumper-go -p vendor -o pd payload.bin
+              elif grep -qE '(^|/)vendor\.new\.dat\.br$' list.txt; then
+                unzip -j -o rom.bin '*vendor.new.dat.br' '*vendor.transfer.list' -d .
+                rm -f rom.bin
+                brotli -d vendor.new.dat.br -o vendor.new.dat
+                python3 "$SDAT" vendor.transfer.list vendor.new.dat vendor.img
+              elif grep -qE '(^|/)vendor\.new\.dat$' list.txt; then
+                unzip -j -o rom.bin '*vendor.new.dat' '*vendor.transfer.list' -d .
+                rm -f rom.bin
+                python3 "$SDAT" vendor.transfer.list vendor.new.dat vendor.img
+              elif grep -qE '(^|/)vendor\.img$' list.txt; then
+                unzip -j -o rom.bin '*vendor.img' -d .
+                rm -f rom.bin
+              else
+                echo "No payload.bin / vendor.new.dat(.br) / vendor.img inside the zip:"; cat list.txt; exit 1
+              fi
+
+            elif echo "$kind" | grep -qiE "gzip|tar archive"; then
+              # fastboot ROM (.tgz): images/vendor.img
+              tar -xf rom.bin --wildcards '*vendor.img'
+              rm -f rom.bin
+
+            elif echo "$kind" | grep -qi "brotli\|data"; then
+              # a bare vendor.new.dat.br link needs vendor.transfer.list too, so it is not supported
+              echo "Unknown file type: $kind"; exit 1
+            else
+              echo "Unsupported file type: $kind"; exit 1
+            fi
+
+            local img; img="$(find . -name 'vendor.img' | head -1)"
+            if [ -z "$img" ]; then echo "vendor.img not found"; exit 1; fi
+
+            # sparse -> raw
+            if file -b "$img" | grep -qi "sparse"; then
+              simg2img "$img" raw.img && mv -f raw.img "$img"
+            fi
+
+            mv -f "$img" "$ROOT/out/vendor_${name}.img"
+            cd "$ROOT"; rm -rf "work/$name"
+            ls -lh "out/vendor_${name}.img"
+            echo "::endgroup::"
+          }
+
+          make_vendor oneplus6 "$OP_LINK"
+          make_vendor pocof1 "$POCO_LINK"
+
+      - name: Pull sensors files and checksums
+        if: ${{ inputs.extract_sensors }}
+        run: |
+          set -uo pipefail
+          FILES="bin/sensors.qti
+          lib64/libssc.so
+          lib64/libsnsapi.so
+          lib64/libsensorcal.so
+          lib64/sensors.ssc.so
+          lib64/libsnsdiaglog.so
+          lib64/libprotobuf-cpp-full.so
+          lib64/libprotobuf-cpp-lite-3.9.1.so
+          lib64/vendor.qti.hardware.sensorscalibrate@1.0.so
+          bin/hw/vendor.qti.hardware.sensorscalibrate@1.0-service"
+
+          for img in out/vendor_*.img; do
+            [ -f "$img" ] || continue
+            n="$(basename "$img" .img)"; n="${n#vendor_}"
+            mkdir -p "sensors_$n" "mnt_$n"
+            if sudo mount -o loop,ro "$img" "mnt_$n" 2>/dev/null; then
+              SRC="mnt_$n"
+            else
+              echo "mount failed, trying 7z for $n"
+              7z x -y "$img" -o"mnt_$n" >/dev/null
+              SRC="mnt_$n"
+            fi
+            for f in $FILES; do
+              f="$(echo "$f" | xargs)"
+              if [ -f "$SRC/$f" ]; then
+                mkdir -p "sensors_$n/$(dirname "$f")"
+                sudo cp "$SRC/$f" "sensors_$n/$f"
+              else
+                echo "MISSING in $n: $f"
+              fi
+            done
+            sudo chown -R "$(id -u):$(id -g)" "sensors_$n"
+            (cd "sensors_$n" && find . -type f | sort | xargs sha256sum) > "sens_$n.txt"
+            echo "== $n: libssc.so contains put_n_locks? =="
+            grep -c put_n_locks "sensors_$n/lib64/libssc.so" 2>/dev/null || true
+            sudo umount "mnt_$n" 2>/dev/null || true
+          done
+
+      - name: Compress and upload to release
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          cd out
+          for f in vendor_*.img; do xz -T0 -6 -f "$f"; done
+          cd ..
+          for d in sensors_*/; do d="${d%/}"; zip -qr "out/$d.zip" "$d"; done
+          for t in sens_*.txt; do cp "$t" out/; done
+          ls -lh out
+          gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1 || \
+            gh release create "$TAG" --repo "${{ github.repository }}" \
+              --title "$TAG" --notes "Extracted vendor images"
+          gh release upload "$TAG" out/* --repo "${{ github.repository }}" --clobber
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sensors-info
+          path: |
+            sens_*.txt
+            out/sensors_*.zip
+          if-no-files-found: ignore
