@@ -69,6 +69,14 @@ jobs:
             rm -rf "work/$name"; mkdir -p "work/$name"; cd "work/$name"
 
             fetch "$url" rom.bin
+            
+            # Check if downloaded file is an HTML error page (e.g. 404, Cloudflare block)
+            if head -c 100 rom.bin | grep -qiE "<html|<head"; then
+              echo "Error: Downloaded file for $name appears to be an HTML page, not a ROM. Check your link."
+              head -n 20 rom.bin
+              exit 1
+            fi
+
             local kind; kind="$(file -b rom.bin)"
             echo "Downloaded: $kind"
 
@@ -76,10 +84,14 @@ jobs:
               # raw payload.bin
               payload-dumper-go -p vendor -o pd rom.bin
 
-            elif echo "$kind" | grep -qi "zip"; then
+            elif echo "$kind" | grep -qiE "zip|Java archive"; then
+              # Handle both standard ZIPs and archives identified as Java archives (JAR/ZIP structures)
+              if ! unzip -t rom.bin >/dev/null 2>&1; then
+                echo "Error: rom.bin is not a valid zip/jar archive."
+                exit 1
+              fi
               unzip -Z1 rom.bin > list.txt
               if grep -qE '(^|/)payload\.bin$' list.txt; then
-                # A/B OTA: pull only payload.bin, then only the vendor partition
                 unzip -j -o rom.bin '*payload.bin' -d .
                 rm -f rom.bin
                 payload-dumper-go -p vendor -o pd payload.bin
@@ -100,13 +112,9 @@ jobs:
               fi
 
             elif echo "$kind" | grep -qiE "gzip|tar archive"; then
-              # fastboot ROM (.tgz): images/vendor.img
               tar -xf rom.bin --wildcards '*vendor.img'
               rm -f rom.bin
 
-            elif echo "$kind" | grep -qi "brotli\|data"; then
-              # a bare vendor.new.dat.br link needs vendor.transfer.list too, so it is not supported
-              echo "Unknown file type: $kind"; exit 1
             else
               echo "Unsupported file type: $kind"; exit 1
             fi
